@@ -13,7 +13,6 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = Flask(__name__)
 
-# 環境變數
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 TDX_CLIENT_ID = os.environ.get("TDX_CLIENT_ID")
@@ -22,13 +21,23 @@ TDX_CLIENT_SECRET = os.environ.get("TDX_CLIENT_SECRET")
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 常用大站
-POPULAR_STATIONS = ["台北", "板橋", "桃園", "新竹", "台中", "嘉義", "台南", "高雄", "花蓮", "台東"]
+# 站名 → TDX 站代碼
+STATION_MAP = {
+    "台北": "1000",
+    "板橋": "1010",
+    "桃園": "1040",
+    "新竹": "1060",
+    "台中": "1120",
+    "嘉義": "1190",
+    "台南": "1210",
+    "高雄": "1225",
+    "花蓮": "0500",
+    "台東": "0360",
+}
 
-# 用戶狀態暫存（記錄選站流程）
+POPULAR_STATIONS = list(STATION_MAP.keys())
 user_state = {}
 
-# ── TDX 取得 Access Token ──────────────────────────────────────────
 def get_tdx_token():
     url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
     data = {
@@ -39,40 +48,25 @@ def get_tdx_token():
     res = requests.post(url, data=data)
     return res.json().get("access_token")
 
-# ── 查詢時刻表 ────────────────────────────────────────────────────
-def get_timetable(origin, destination, date_str):
+def get_timetable(origin_name, destination_name, date_str):
+    origin_id = STATION_MAP.get(origin_name)
+    dest_id = STATION_MAP.get(destination_name)
+    if not origin_id or not dest_id:
+        return None
+
     token = get_tdx_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = (
         f"https://tdx.transportdata.tw/api/basic/v3/Rail/TRA/DailyTrainTimetable/OD"
-        f"/{origin}/{destination}/{date_str}"
+        f"/{origin_id}/{dest_id}/{date_str}"
         f"?%24top=5&%24format=JSON"
     )
     res = requests.get(url, headers=headers)
     if res.status_code != 200:
         return None
     data = res.json()
-    trains = data.get("TrainTimetables", [])
-    return trains[:5]
+    return data.get("TrainTimetables", [])[:5]
 
-# ── 查詢即時動態（誤點） ──────────────────────────────────────────
-def get_live_delay(train_no, station_id):
-    token = get_tdx_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    url = (
-        f"https://tdx.transportdata.tw/api/basic/v3/Rail/TRA/LiveBoard/Station/{station_id}"
-        f"?%24format=JSON"
-    )
-    res = requests.get(url, headers=headers)
-    if res.status_code != 200:
-        return None
-    items = res.json().get("TrainLiveBoards", [])
-    for item in items:
-        if str(item.get("TrainNo")) == str(train_no):
-            return item.get("DelayTime", 0)
-    return None
-
-# ── 格式化結果訊息 ────────────────────────────────────────────────
 def format_result(trains, origin, destination, date_label):
     if not trains:
         return f"😕 找不到 {origin} → {destination} 的班次\n請確認站名是否正確"
@@ -85,8 +79,11 @@ def format_result(trains, origin, destination, date_label):
         train_no = info.get("TrainNo", "")
         train_type = info.get("TrainTypeName", {}).get("Zh_tw", "")
 
-        dep = next((s for s in stops if s.get("StationName", {}).get("Zh_tw") == origin), None)
-        arr = next((s for s in stops if s.get("StationName", {}).get("Zh_tw") == destination), None)
+        origin_id = STATION_MAP.get(origin)
+        dest_id = STATION_MAP.get(destination)
+
+        dep = next((s for s in stops if s.get("StationID") == origin_id), None)
+        arr = next((s for s in stops if s.get("StationID") == dest_id), None)
 
         if not dep or not arr:
             continue
@@ -94,7 +91,6 @@ def format_result(trains, origin, destination, date_label):
         dep_time = dep.get("DepartureTime", "--:--")
         arr_time = arr.get("ArrivalTime", "--:--")
 
-        # 計算行程時間
         try:
             d = datetime.strptime(dep_time, "%H:%M")
             a = datetime.strptime(arr_time, "%H:%M")
@@ -107,18 +103,19 @@ def format_result(trains, origin, destination, date_label):
 
         lines.append(f"{train_type} {train_no}｜{dep_time} → {arr_time}（{duration}）✅")
 
+    if len(lines) == 1:
+        return f"😕 找不到 {origin} → {destination} 的班次"
+
     lines.append("\n查明天請傳：台北 高雄 明天")
     return "\n".join(lines)
 
-# ── 建立選站 Quick Reply ──────────────────────────────────────────
-def make_station_quick_reply(stations, prefix=""):
+def make_station_quick_reply(stations):
     items = [
-        QuickReplyItem(action=MessageAction(label=s, text=f"{prefix}{s}"))
+        QuickReplyItem(action=MessageAction(label=s, text=s))
         for s in stations
     ]
     return QuickReply(items=items)
 
-# ── 解析日期 ──────────────────────────────────────────────────────
 def parse_date(text):
     today = datetime.now()
     if "明天" in text:
@@ -130,7 +127,6 @@ def parse_date(text):
     else:
         return today.strftime("%Y-%m-%d"), "今天"
 
-# ── LINE Webhook ──────────────────────────────────────────────────
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -149,82 +145,62 @@ def handle_message(event):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        # ── 打字輸入：「台北 高雄」或「台北 高雄 明天」
+        # 打字輸入：「台北 高雄」或「台北 高雄 明天」
         parts = text.split()
-        if len(parts) >= 2 and parts[0] in POPULAR_STATIONS and parts[1] in POPULAR_STATIONS:
-            origin = parts[0]
-            destination = parts[1]
+        if len(parts) >= 2 and parts[0] in STATION_MAP and parts[1] in STATION_MAP:
+            origin, destination = parts[0], parts[1]
             date_str, date_label = parse_date(text)
             trains = get_timetable(origin, destination, date_str)
             msg = format_result(trains, origin, destination, date_label)
             user_state.pop(user_id, None)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=msg)]
-                )
-            )
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]
+            ))
             return
 
-        # ── 第二步：已選出發站，現在選目的站
+        # 第二步：選目的站
         if user_id in user_state and user_state[user_id].get("step") == "choose_dest":
             origin = user_state[user_id]["origin"]
-            # 過濾掉出發站
-            dest_stations = [s for s in POPULAR_STATIONS if s != origin]
-            if text in dest_stations:
-                destination = text
-                date_str, date_label = parse_date("")
-                trains = get_timetable(origin, destination, date_str)
-                msg = format_result(trains, origin, destination, date_label)
-                user_state.pop(user_id, None)
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                return
-            else:
-                # 不在清單，當作打字輸入目的站
-                destination = text
-                date_str, date_label = parse_date("")
-                trains = get_timetable(origin, destination, date_str)
-                msg = format_result(trains, origin, destination, date_label)
-                user_state.pop(user_id, None)
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
-                    )
-                )
-                return
-
-        # ── 第一步：選出發站（按鈕點進來的站名）
-        if text in POPULAR_STATIONS:
-            user_state[user_id] = {"step": "choose_dest", "origin": text}
-            dest_stations = [s for s in POPULAR_STATIONS if s != text]
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
+            destination = text if text in STATION_MAP else text
+            if destination not in STATION_MAP:
+                line_bot_api.reply_message(ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[TextMessage(
-                        text=f"出發站：{text}\n請選擇到達站（或直接打站名）",
-                        quick_reply=make_station_quick_reply(dest_stations)
-                    )]
-                )
-            )
+                    messages=[TextMessage(text=f"😕 找不到「{destination}」這個站，請選按鈕或輸入正確站名")]
+                ))
+                return
+            date_str, date_label = parse_date("")
+            trains = get_timetable(origin, destination, date_str)
+            msg = format_result(trains, origin, destination, date_label)
+            user_state.pop(user_id, None)
+            line_bot_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]
+            ))
             return
 
-        # ── 預設：顯示選站選單
-        user_state[user_id] = {"step": "choose_origin"}
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
+        # 第一步：選出發站
+        if text in STATION_MAP:
+            user_state[user_id] = {"step": "choose_dest", "origin": text}
+            dest_stations = [s for s in POPULAR_STATIONS if s != text]
+            line_bot_api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(
-                    text="🚂 湯馬士小火車\n\n請選擇出發站（或直接打「台北 高雄」查詢）",
-                    quick_reply=make_station_quick_reply(POPULAR_STATIONS)
+                    text=f"出發站：{text}\n請選擇到達站（或直接打站名）",
+                    quick_reply=make_station_quick_reply(dest_stations)
                 )]
-            )
-        )
+            ))
+            return
+
+        # 預設：顯示選站選單
+        user_state[user_id] = {"step": "choose_origin"}
+        line_bot_api.reply_message(ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(
+                text="🚂 湯馬士小火車\n\n請選擇出發站（或直接打「台北 高雄」查詢）",
+                quick_reply=make_station_quick_reply(POPULAR_STATIONS)
+            )]
+        ))
 
 @app.route("/", methods=["GET"])
 def index():
